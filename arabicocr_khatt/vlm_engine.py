@@ -51,58 +51,61 @@ def prepare_line(ln: Image.Image, line_h: int = LINE_H) -> Image.Image:
     return canvas
 
 
-class QariLineOCR:
-    """Lazy, thread-safe, auto-unloading wrapper around Qari-OCR v0.4."""
+class LazyVLM:
+    """Lazy, thread-safe, auto-unloading holder for one 4-bit VLM.
+
+    Subclasses implement ``_build() -> (model, processor)``. Only one LazyVLM is
+    resident at a time (loading one unloads the others): two ~4 GB models do not
+    fit next to each other on a shared T4.
+    """
+
+    _instances: List["LazyVLM"] = []
 
     def __init__(self, device: str = "cuda"):
         self.device = device
-        self._model = None
-        self._proc = None
-        self._lock = threading.Lock()
+        self.model = None
+        self.proc = None
+        self.lock = threading.RLock()
         self._last_used = 0.0
         self._timer: Optional[threading.Timer] = None
+        LazyVLM._instances.append(self)
 
     @property
     def loaded(self) -> bool:
-        return self._model is not None
+        return self.model is not None
 
-    def _load(self):
+    def _build(self):
+        raise NotImplementedError
+
+    def ensure_loaded(self):
+        if self.model is not None:
+            return
+        for other in LazyVLM._instances:
+            if other is not self:
+                other.unload()
         import torch
-        from peft import PeftModel
-        from transformers import (AutoProcessor, BitsAndBytesConfig,
-                                  Qwen3VLForConditionalGeneration)
-
         dev = torch.device(self.device)
         if dev.type == "cuda":
             idx = dev.index if dev.index is not None else torch.cuda.current_device()
             total = torch.cuda.get_device_properties(idx).total_memory
             # Hard cap: on a shared GPU we should OOM ourselves, not the neighbour.
             torch.cuda.set_per_process_memory_fraction(min(1.0, BUDGET_GB * 2**30 / total), idx)
-        quant = BitsAndBytesConfig(
-            load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True,
-            bnb_4bit_compute_dtype=torch.float16, llm_int8_skip_modules=["visual", "lm_head"])
-        model = Qwen3VLForConditionalGeneration.from_pretrained(
-            BASE_ID, torch_dtype=torch.float16, device_map={"": str(dev)},
-            attn_implementation="sdpa", quantization_config=quant).eval()
-        self._model = PeftModel.from_pretrained(model, ADAPTER_ID).eval()
-        self._proc = AutoProcessor.from_pretrained(ADAPTER_ID)
-        self._proc.tokenizer.padding_side = "left"  # batched generation
+        self.model, self.proc = self._build()
 
     def unload(self):
-        with self._lock:
-            self._unload_locked()
+        with self.lock:
+            if self.model is None:
+                return
+            import gc
+            import torch
+            self.model = self.proc = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-    def _unload_locked(self):
-        if self._model is None:
-            return
-        import gc
-        import torch
-        self._model = self._proc = None
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-    def _arm_idle_timer(self):
+    def touch(self):
+        """Mark as used now and (re)arm the idle-unload timer."""
+        self._last_used = time.time()
         if self._timer:
             self._timer.cancel()
         if IDLE_S > 0:
@@ -111,9 +114,33 @@ class QariLineOCR:
             self._timer.start()
 
     def _idle_check(self):
-        with self._lock:
+        with self.lock:
             if time.time() - self._last_used >= IDLE_S:
-                self._unload_locked()
+                self.unload()
+
+
+def nf4_config(skip=("visual", "lm_head")):
+    import torch
+    from transformers import BitsAndBytesConfig
+    return BitsAndBytesConfig(
+        load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True,
+        bnb_4bit_compute_dtype=torch.float16, llm_int8_skip_modules=list(skip))
+
+
+class QariLineOCR(LazyVLM):
+    """Qari-OCR v0.4 (Qwen3-VL-4B + Arabic LoRA), one line crop per request."""
+
+    def _build(self):
+        import torch
+        from peft import PeftModel
+        from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+        model = Qwen3VLForConditionalGeneration.from_pretrained(
+            BASE_ID, torch_dtype=torch.float16, device_map={"": self.device},
+            attn_implementation="sdpa", quantization_config=nf4_config()).eval()
+        model = PeftModel.from_pretrained(model, ADAPTER_ID).eval()
+        proc = AutoProcessor.from_pretrained(ADAPTER_ID)
+        proc.tokenizer.padding_side = "left"  # batched generation
+        return model, proc
 
     def recognize_lines(self, lines: List[Image.Image],
                         progress: Optional[Callable[[int, int], None]] = None) -> List[str]:
@@ -121,9 +148,8 @@ class QariLineOCR:
         import torch
         if not lines:
             return []
-        with self._lock:
-            if self._model is None:
-                self._load()
+        with self.lock:
+            self.ensure_loaded()
             prepped = [prepare_line(ln) for ln in lines]
             texts: List[str] = []
             for i in range(0, len(prepped), BATCH):
@@ -136,22 +162,21 @@ class QariLineOCR:
                     texts += [self._generate([im], torch)[0] for im in chunk]
                 if progress:
                     progress(min(i + BATCH, len(prepped)), len(prepped))
-            self._last_used = time.time()
-            self._arm_idle_timer()
+            self.touch()
             return texts
 
     def _generate(self, imgs: List[Image.Image], torch) -> List[str]:
         msgs = [[{"role": "user", "content": [{"type": "image", "image": im},
                                               {"type": "text", "text": PROMPT}]}] for im in imgs]
-        prompts = [self._proc.apply_chat_template(m, tokenize=False, add_generation_prompt=True)
+        prompts = [self.proc.apply_chat_template(m, tokenize=False, add_generation_prompt=True)
                    for m in msgs]
-        inputs = self._proc(text=prompts, images=imgs, padding=True,
-                            return_tensors="pt").to(self._model.device)
+        inputs = self.proc(text=prompts, images=imgs, padding=True,
+                           return_tensors="pt").to(self.model.device)
         with torch.inference_mode():
-            out = self._model.generate(**inputs, max_new_tokens=MAX_NEW_TOKENS,
-                                       do_sample=False, repetition_penalty=1.05)
+            out = self.model.generate(**inputs, max_new_tokens=MAX_NEW_TOKENS,
+                                      do_sample=False, repetition_penalty=1.05)
         out = out[:, inputs["input_ids"].shape[1]:]
-        return [t.strip() for t in self._proc.batch_decode(out, skip_special_tokens=True)]
+        return [t.strip() for t in self.proc.batch_decode(out, skip_special_tokens=True)]
 
 
 _engine: Optional[QariLineOCR] = None

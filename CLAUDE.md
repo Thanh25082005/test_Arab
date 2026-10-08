@@ -106,7 +106,14 @@ arabicocr_khatt/
   compare_runs.py     -- Multi-run metrics comparison (head-to-head table)
   dict_ceiling.py     -- Oracle CER ceiling of lexicon-based correction
   monitor.py          -- Local web dashboard for a training run
-  webocr.py           -- Gradio web demo / test bench (beam search, line segmentation)
+  webocr.py           -- Gradio web demo / test bench (Crop & Test tab: drag-to-crop,
+                         engine choice, line-by-line review with [؟] highlights)
+  vlm_engine.py       -- LazyVLM base (lazy load, idle unload, one VLM resident, hard
+                         VRAM cap) + Qari-OCR v0.4 line engine for typed/printed Arabic
+  hw_engine.py        -- Handwriting pipeline: Kraken lines + sherif v3 (Qwen2.5-VL-3B)
+                         5-pass readings + ROVER word vote, [؟] on disagreement
+  kraken_worker.py    -- Kraken blla segmentation; runs as a file inside the separate
+                         Kraken venv (ARABICOCR_KRAKEN_PY), never imports this package
   charset_arabic.txt  -- 70 characters + 5 special tokens = 75 classes
   show_metrics.py     -- CLI tool to view training metrics from CSV
   __init__.py         -- Package init (empty)
@@ -137,7 +144,9 @@ metrics.py        -- standalone (rapidfuzz)
 preprocess.py     -- standalone (cv2, numpy, PIL)
 dataset.py        -- imports preprocess
 train_crnn_ctc.py -- imports dataset, metrics, model, augment
-webocr.py         -- imports model, preprocess
+webocr.py         -- imports model, preprocess, pipeline (vlm_engine/hw_engine lazily)
+vlm_engine.py     -- standalone (torch, transformers, bitsandbytes, peft)
+hw_engine.py      -- imports vlm_engine, pipeline; shells out to kraken_worker.py
 ```
 
 ## Commands

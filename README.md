@@ -126,8 +126,28 @@ CUDA_VISIBLE_DEVICES=1 python -m arabicocr_khatt.webocr --port 7861   # --host 0
 ```
 
 The **Crop & Test** tab lets you upload a page, press-drag-release to crop a
-single line, and see the recognition, CER/WER against an optional ground
-truth, and a per-session history of all crops (exportable as TSV).
+region, and see the recognition, a line-by-line check (each line image above its
+text), CER/WER against an optional ground truth, and a per-session history of
+all crops (exportable as TSV). Three engines:
+
+| Engine | For | How |
+|---|---|---|
+| Qari-OCR v0.4 | typed / printed Arabic | Qwen3-VL-4B + Arabic LoRA (4-bit), one request per line |
+| Handwriting | pen handwriting, phone photos, ruled paper | Kraken baseline line finder + sherif v3 (Qwen2.5-VL-3B HTR), 5 differently-cropped readings, word-level majority vote; words the readings disagree on are marked `[؟]` |
+| KHATT CRNN | clean scanned handwriting lines | this repo's model |
+
+On a 1972 handwritten contract (phone photo, ruled paper) the handwriting engine
+recovers ~61% of the reference words vs ~18% for the previous pipeline; words it
+leaves unflagged are ~70% correct, words flagged `[؟]` ~12%.
+
+```bash
+pip install -e ".[demo,vlm]"
+# Kraken pins its own torch: give it a separate venv and point the demo at it
+python -m uv venv ~/venvs/kraken && python -m uv pip install -p ~/venvs/kraken/bin/python \
+    --torch-backend cpu "kraken>=6"
+export ARABICOCR_KRAKEN_PY=~/venvs/kraken/bin/python
+export ARABICOCR_VLM_BUDGET_GB=4.6     # hard VRAM cap for the VLM engines (shared GPUs)
+```
 
 ## Publishing weights to the Hub
 

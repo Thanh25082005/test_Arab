@@ -2,6 +2,7 @@
 import html as _html
 import os
 import random
+import re
 import time
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
@@ -777,8 +778,11 @@ def run_batch(files: list, use_beam: bool, beam_width: int, lm_weight: float,
 _CROP_DISPLAY_MAX = 1600  # px; bigger uploads are shown downscaled, drags mapped back
 _CROP_HIST_HEADERS = ["#", "engine", "box (x0,y0,x1,y1)", "size", "prediction",
                       "ground truth", "CER %", "ms"]
-ENGINE_QARI = "Qari-OCR v0.4 — printed / typed Arabic (VLM, recommended)"
-ENGINE_KHATT = "KHATT CRNN — handwriting (fast)"
+ENGINE_QARI = "Qari-OCR v0.4 — printed / typed Arabic"
+ENGINE_HW = "Handwriting — Kraken lines + sherif v3, 5-pass vote (~5 min/page)"
+ENGINE_KHATT = "KHATT CRNN — clean scanned handwriting lines (fast)"
+_ENGINE_SHORT = {ENGINE_QARI: "Qari", ENGINE_HW: "HW-vote", ENGINE_KHATT: "KHATT"}
+_UNSURE_RE = re.compile(r"(\S+) \[؟\]")
 
 # Gradio has no drag event on images: this script draws the rubber band, converts
 # the released rectangle to the displayed image's pixel coords (object-fit aware),
@@ -959,6 +963,9 @@ def _line_flag(text: str) -> str:
         return "empty — nothing read on this line"
     if sum(c in _TASHKEEL for c in letters) / len(letters) > 0.15:
         return "heavy diacritics — possibly invented text (signature / stamp?)"
+    words = [w for w in text.split() if w != "[؟]"]
+    if words and text.count("[؟]") / len(words) > 0.3:
+        return "many words the OCR passes disagree on — check against the image"
     return ""
 
 
@@ -974,15 +981,20 @@ def _lines_review_html(lines: List[Image.Image], texts: List[str]) -> str:
         buf = io.BytesIO()
         th.save(buf, "PNG")
         flag = _line_flag(t)
+        body = _UNSURE_RE.sub(r'<span class="unc" title="OCR passes disagree">\1</span>',
+                              _html.escape(t))
         rows.append(
             f'<div class="lr{" bad" if flag else ""}"><span class="n">{i}</span>'
             f'<img src="data:image/png;base64,{base64.b64encode(buf.getvalue()).decode()}">'
-            f'<div class="tx">{_html.escape(t) or "—"}</div>'
+            f'<div class="tx">{body or "—"}</div>'
             + (f'<div class="fl">⚠ {flag}</div>' if flag else "") + "</div>")
     n_bad = sum(bool(_line_flag(t)) for t in texts)
+    n_unsure = sum(t.count("[؟]") for t in texts)
     head = (f'<div class="lr-head">{len(lines)} line(s) detected · '
             f'{len(lines) - n_bad} read cleanly'
-            + (f' · <b>{n_bad} need a look</b>' if n_bad else "") + "</div>")
+            + (f' · <b>{n_bad} need a look</b>' if n_bad else "")
+            + (f' · <span class="unc">{n_unsure} uncertain word(s)</span> [؟] — passes '
+               f'disagreed; check these first' if n_unsure else "") + "</div>")
     return _LINES_CSS + '<div class="lr-wrap">' + head + "".join(rows) + "</div>"
 
 
@@ -998,6 +1010,7 @@ _LINES_CSS = """
   .lr .tx { direction:rtl; text-align:right; font-size:1.3rem; line-height:1.9;
             font-family:"Noto Naskh Arabic","Geeza Pro","Arabic Typesetting","Segoe UI",Tahoma,sans-serif; }
   .lr .fl { font-size:.8em; color:#f85149; }
+  .unc { color:#f85149; text-decoration:underline wavy rgba(248,81,73,.7); }
 </style>
 """
 
@@ -1011,6 +1024,16 @@ def _recognize_qari(crop: Image.Image, force_multiline: bool, progress) -> Tuple
     texts = eng.recognize_lines(
         lines, progress=lambda d, n: progress(d / n, desc=f"Reading line {d}/{n}"))
     return "\n".join(texts), stack_preview([prepare_line(l) for l in lines]), lines, texts
+
+
+def _recognize_hw(crop: Image.Image, progress) -> Tuple[str, Image.Image, list, list, str]:
+    from .hw_engine import recognize_handwritten
+    from .vlm_engine import prepare_line
+    lines, texts, flagged, used_kraken = recognize_handwritten(
+        crop, device=str(device), progress=lambda f, msg: progress(f, desc=msg))
+    note = (f" · {flagged} word(s) flagged [؟] · lines: "
+            + ("Kraken" if used_kraken else "repo segmenter (set ARABICOCR_KRAKEN_PY for Kraken)"))
+    return "\n".join(texts), stack_preview([prepare_line(l) for l in lines]), lines, texts, note
 
 
 @torch.inference_mode()
@@ -1029,11 +1052,14 @@ def crop_recognize_cb(st: Optional[dict], engine_label: str, pad: float, angle: 
                 "", "", "", history, history)
 
     crop = rotate_if_needed(st["img"].crop((x0, y0, x1, y1)), angle)
-    use_qari = engine_label == ENGINE_QARI
+    engine_short = _ENGINE_SHORT.get(engine_label, "KHATT")
+    note = ""
     t0 = time.perf_counter()
     try:
-        if use_qari:
+        if engine_label == ENGINE_QARI:
             txt, prev, lines, texts = _recognize_qari(crop, bool(force_multiline), progress)
+        elif engine_label == ENGINE_HW:
+            txt, prev, lines, texts, note = _recognize_hw(crop, progress)
         else:
             txt, prev = recognize_image(
                 crop, upscale=float(upscale), auto_upscale=bool(auto_upscale),
@@ -1047,12 +1073,12 @@ def crop_recognize_cb(st: Optional[dict], engine_label: str, pad: float, angle: 
         return (*keep, _err(f"{type(e).__name__}: {e}"), "", "", "", history, history)
     elapsed_ms = (time.perf_counter() - t0) * 1000
     gt = (gt_text or "").strip()
-    info = (f'<span style="color:#8b949e">{"Qari-OCR v0.4" if use_qari else "KHATT CRNN"} · '
+    info = (f'<span style="color:#8b949e">{engine_short} · '
             f'crop {x1 - x0}×{y1 - y0}px · {len(lines)} line(s) · '
-            f'{elapsed_ms / 1000:.1f} s · device={device}</span>')
+            f'{elapsed_ms / 1000:.1f} s · device={device}{_html.escape(note)}</span>')
 
     history = list(history or []) + [[
-        len(history or []) + 1, "Qari" if use_qari else "KHATT",
+        len(history or []) + 1, engine_short,
         f"{x0},{y0},{x1},{y1}", f"{x1 - x0}×{y1 - y0}",
         txt.replace("\n", " ⏎ "), gt, f"{cer_raw(gt, txt) * 100:.2f}" if gt else "",
         f"{elapsed_ms:.0f}",
@@ -1116,10 +1142,12 @@ with gr.Blocks(title="Arabic OCR — Test Bench", head=_CROP_DRAG_HEAD, css=_CRO
                     crop_pad = gr.Slider(0, 60, value=6, step=1, label="Padding around box (px)",
                                          info="keeps dots near the box edge from being cut")
                     crop_engine = gr.Radio(
-                        [ENGINE_QARI, ENGINE_KHATT], value=ENGINE_QARI, label="OCR engine",
-                        info="Qari reads typed/printed pages far better (72% vs 9% of words "
-                             "on 1970s typed letters); first use downloads ~3 GB and loads "
-                             "for ~30 s. KHATT is the handwriting model of this repo.")
+                        [ENGINE_QARI, ENGINE_HW, ENGINE_KHATT], value=ENGINE_QARI,
+                        label="OCR engine",
+                        info="Typed/printed → Qari (72% of words on 1970s typed letters). "
+                             "Pen handwriting → Handwriting (Kraken line finder + sherif v3, "
+                             "5 readings voted; words the readings disagree on are marked [؟]). "
+                             "First use of a VLM engine downloads it and loads for ~40 s.")
                     crop_auto = gr.Checkbox(value=True,
                                             label="Recognize automatically on release")
                     with gr.Accordion("Recognition options (segmentation applies to both "
