@@ -41,6 +41,8 @@ dependencies = [
 demo = ["gradio>=4.0", "pandas>=2.0", "torchvision>=0.17"]
 train = ["pandas>=2.0", "scikit-learn>=1.3", "torchvision>=0.17"]
 synth = ["uharfbuzz>=0.39", "freetype-py>=2.4"]
+# Qari-OCR v0.4 line engine (vlm_engine.py) for typed/printed Arabic
+vlm = ["transformers>=4.57", "accelerate>=1.0", "bitsandbytes>=0.45", "peft>=0.17"]
 
 [project.urls]
 Homepage = "https://github.com/FixFips/ArabicOCR_KHATT"

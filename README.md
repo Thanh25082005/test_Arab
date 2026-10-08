@@ -120,7 +120,14 @@ confidence heatmaps, char-level diff against ground truth, and batch evaluation:
 ```bash
 pip install -e ".[demo]"
 python -m arabicocr_khatt.webocr
+
+# shared multi-GPU server: pin a GPU and pick a free port
+CUDA_VISIBLE_DEVICES=1 python -m arabicocr_khatt.webocr --port 7861   # --host 0.0.0.0 / --share
 ```
+
+The **Crop & Test** tab lets you upload a page, press-drag-release to crop a
+single line, and see the recognition, CER/WER against an optional ground
+truth, and a per-session history of all crops (exportable as TSV).
 
 ## Publishing weights to the Hub
 

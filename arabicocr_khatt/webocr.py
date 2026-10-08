@@ -21,7 +21,8 @@ from .metrics import cer as cer_raw, wer as wer_raw, dot_group_cer
 from .model import CRNN, ctc_greedy_decode, ctc_beam_decode, build_bigram_lm
 from .preprocess import to_grayscale, binarize, normalize, resize_keep_ratio_height, pad_width
 from .pipeline import (
-    HEIGHT, MAX_W, load_checkpoint, prep_line, segment_into_lines,
+    BIGRAM_LM_FILENAME, DEFAULT_CKPT_FILENAME, DEFAULT_REPO_ID, HEIGHT, MAX_W,
+    load_bigram_lm_json, load_checkpoint, prep_line, segment_into_lines,
 )
 
 
@@ -56,9 +57,13 @@ def _np_to_pil(arr: np.ndarray) -> Image.Image:
 def ensure_pil_from_editor(x: Any, use_cropped: bool = True) -> Image.Image:
     if isinstance(x, dict):
         cand = None
-        if use_cropped and "image" in x:
+        # Gradio 4+/5 ImageEditor: "composite" is the cropped/edited result,
+        # "background" the original upload. ("image" is the legacy Gradio 3 key.)
+        if use_cropped and x.get("composite") is not None:
+            cand = x["composite"]
+        elif use_cropped and x.get("image") is not None:
             cand = x["image"]
-        elif "background" in x:
+        elif x.get("background") is not None:
             cand = x["background"]
         elif "layers" in x and isinstance(x["layers"], list) and len(x["layers"]) > 0:
             cand = x["layers"][-1]
@@ -256,11 +261,12 @@ def rotate_if_needed(pil: Image.Image, angle_deg: float) -> Image.Image:
 
 
 # ---------------- Model init ----------------
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# ARABICOCR_DEVICE pins the device (e.g. "cuda:1" on a shared multi-GPU box).
+device = torch.device(os.environ.get("ARABICOCR_DEVICE")
+                      or ("cuda" if torch.cuda.is_available() else "cpu"))
 if not os.path.exists(CKPT):
     # No local checkpoint (e.g. HF Space / fresh clone): pull from the Hub.
     from huggingface_hub import hf_hub_download
-    from .pipeline import DEFAULT_CKPT_FILENAME, DEFAULT_REPO_ID
     CKPT = hf_hub_download(DEFAULT_REPO_ID, DEFAULT_CKPT_FILENAME)
 vocab, id2char, state_dict, _use_attn = load_vocab_from_ckpt(CKPT)
 char2id = {c: i for i, c in enumerate(vocab)}
@@ -272,14 +278,27 @@ to_tensor = transforms.ToTensor()
 
 # ---------------- Optional bigram LM for beam search ----------------
 _bigram_lm: Optional[dict] = None
+_bigram_lm_hub_tried = False
 def get_bigram_lm():
-    """Lazy-build the bigram LM from the training split on first use."""
-    global _bigram_lm
+    """Lazy-build the bigram LM from the training split on first use.
+
+    Without a local KHATT split (fresh clone / server without archive/),
+    fall back to the LM published next to the weights on the HF Hub.
+    """
+    global _bigram_lm, _bigram_lm_hub_tried
     if _bigram_lm is not None:
         return _bigram_lm
     train_csv = Path(SPLITS_DIR, "train.csv")
     if not train_csv.exists():
-        return None
+        if _bigram_lm_hub_tried:
+            return None
+        _bigram_lm_hub_tried = True
+        try:
+            from huggingface_hub import hf_hub_download
+            _bigram_lm = load_bigram_lm_json(hf_hub_download(DEFAULT_REPO_ID, BIGRAM_LM_FILENAME))
+        except Exception as e:
+            print(f"[webocr] bigram LM unavailable ({e}); beam search runs without LM")
+        return _bigram_lm
     df = pd.read_csv(train_csv)
     texts = []
     for _, row in df.iterrows():
@@ -338,6 +357,18 @@ def _decode_one(im_pil: Image.Image, device: torch.device, id2char,
     return _decode_from_logits(_forward_logits(im_pil), use_beam, beam_width, lm_weight)
 
 
+AUTO_UPSCALE_MIN_H = 64   # px; shorter lines (phone photos of documents) get upscaled
+AUTO_UPSCALE_MAX = 3.0
+
+
+def _line_upscale(ln: Image.Image, upscale: float, auto: bool) -> float:
+    """Binarizing a ~25px line then stretching it to H=96 smears dots together;
+    upscaling first (bicubic) roughly halves CER on small text."""
+    if not auto or ln.height <= 0:
+        return upscale
+    return max(upscale, min(AUTO_UPSCALE_MAX, AUTO_UPSCALE_MIN_H / ln.height))
+
+
 @torch.inference_mode()
 def recognize_image(
     pil_img: Image.Image,
@@ -348,13 +379,16 @@ def recognize_image(
     beam_width: int = 10,
     lm_weight: float = 0.0,
     show_heatmap: bool = True,
+    auto_upscale: bool = False,
 ) -> Tuple[str, Image.Image]:
     lines = segment_into_lines(pil_img) if force_multiline else [pil_img]
 
     previews: List[Image.Image] = []
     texts: List[str] = []
+    base_upscale = upscale
 
     for ln in lines:
+        upscale = _line_upscale(ln, base_upscale, auto_upscale)
         if polarity_mode == "normal":
             prep_best = prep_line(ln, upscale=upscale, force_invert=False)
             logits_best = _forward_logits(prep_best)
@@ -736,13 +770,413 @@ def run_batch(files: list, use_beam: bool, beam_width: int, lm_weight: float,
     return tmp.name, summary
 
 
-with gr.Blocks(title="Arabic OCR — Test Bench") as demo:
+# ---------------- Crop & Test tab ----------------
+# Upload once, then press-drag-release on the canvas to pick a region (rubber-band
+# drawn client-side by _CROP_DRAG_HEAD); each crop is recognized and appended to a
+# per-session history table.
+_CROP_DISPLAY_MAX = 1600  # px; bigger uploads are shown downscaled, drags mapped back
+_CROP_HIST_HEADERS = ["#", "engine", "box (x0,y0,x1,y1)", "size", "prediction",
+                      "ground truth", "CER %", "ms"]
+ENGINE_QARI = "Qari-OCR v0.4 — printed / typed Arabic (VLM, recommended)"
+ENGINE_KHATT = "KHATT CRNN — handwriting (fast)"
+
+# Gradio has no drag event on images: this script draws the rubber band, converts
+# the released rectangle to the displayed image's pixel coords (object-fit aware),
+# stashes it in window.__arabicocrCropBox and clicks the hidden #crop-drag-btn.
+_CROP_DRAG_HEAD = """
+<script>
+(() => {
+  const CANVAS = "#crop-canvas";
+  let drag = null, band = null;
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+  const dropBand = () => { if (band) { band.remove(); band = null; } };
+  const contentBox = (img) => {
+    const r = img.getBoundingClientRect(), nw = img.naturalWidth, nh = img.naturalHeight;
+    const fit = getComputedStyle(img).objectFit;
+    let s = Math.min(r.width / nw, r.height / nh);
+    if (fit === "scale-down") s = Math.min(s, 1);
+    if (fit === "none") s = 1;
+    const w = nw * s, h = nh * s;
+    return { left: r.left + (r.width - w) / 2, top: r.top + (r.height - h) / 2, w, h, s };
+  };
+  const at = (e) => [clamp(e.clientX, drag.b.left, drag.b.left + drag.b.w),
+                     clamp(e.clientY, drag.b.top, drag.b.top + drag.b.h)];
+  const paint = (x, y) => {
+    const l = Math.min(x, drag.x0), t = Math.min(y, drag.y0);
+    Object.assign(band.style, { left: l + "px", top: t + "px",
+      width: Math.abs(x - drag.x0) + "px", height: Math.abs(y - drag.y0) + "px" });
+  };
+  document.addEventListener("pointerdown", (e) => {
+    const img = e.target.closest && e.target.closest(CANVAS + " img");
+    if (!img || e.button !== 0 || !img.naturalWidth) return;
+    e.preventDefault();
+    dropBand();
+    drag = { img, b: contentBox(img) };
+    [drag.x0, drag.y0] = at(e);
+    band = document.createElement("div");
+    band.style.cssText = "position:fixed;z-index:9999;pointer-events:none;" +
+      "border:2px dashed #ff4040;background:rgba(255,64,64,.15)";
+    document.body.appendChild(band);
+    paint(drag.x0, drag.y0);
+    try { img.setPointerCapture(e.pointerId); } catch (_) {}
+  }, true);
+  document.addEventListener("pointermove", (e) => {
+    if (drag) { e.preventDefault(); paint(...at(e)); }
+  }, true);
+  const finish = (e) => {
+    if (!drag) return;
+    const [x, y] = at(e), b = drag.b;
+    const nx0 = (Math.min(x, drag.x0) - b.left) / b.s, nx1 = (Math.max(x, drag.x0) - b.left) / b.s;
+    const ny0 = (Math.min(y, drag.y0) - b.top) / b.s, ny1 = (Math.max(y, drag.y0) - b.top) / b.s;
+    drag = null;
+    if (nx1 - nx0 < 4 || ny1 - ny0 < 4) { dropBand(); return; }  // a click, not a drag
+    window.__arabicocrCropBox = [nx0, ny0, nx1, ny1].map(Math.round).join(",");
+    const btn = document.querySelector("#crop-drag-btn");
+    (btn && btn.tagName !== "BUTTON" ? btn.querySelector("button") : btn)?.click();
+    setTimeout(dropBand, 4000);  // fallback; normally removed when the new overlay loads
+  };
+  document.addEventListener("pointerup", finish, true);
+  document.addEventListener("pointercancel", () => { drag = null; dropBand(); }, true);
+  document.addEventListener("dragstart", (e) => {
+    if (e.target.closest && e.target.closest(CANVAS)) e.preventDefault();
+  }, true);
+  document.addEventListener("load", (e) => {
+    if (e.target.closest && e.target.closest(CANVAS)) dropBand();
+  }, true);
+})();
+</script>
+"""
+_CROP_CSS = """
+#crop-canvas img { cursor: crosshair; touch-action: none; user-select: none;
+                   -webkit-user-drag: none; }
+.crop-hidden { display: none !important; }
+.arabic-text textarea { font-family: "Noto Naskh Arabic", "Geeza Pro", "Arabic Typesetting",
+                        "Traditional Arabic", "Segoe UI", Tahoma, sans-serif;
+                        font-size: 1.35rem; line-height: 1.9; }
+"""
+
+
+def _crop_new_state(pil: Image.Image) -> dict:
+    pil = pil.convert("RGB")
+    scale = min(1.0, _CROP_DISPLAY_MAX / max(pil.size))
+    return {"img": pil, "scale": scale, "box": None}
+
+
+def _pad_box(box: Tuple[int, int, int, int], pad: float, size: Tuple[int, int]):
+    W, H = size
+    p = int(pad or 0)
+    x0, y0, x1, y1 = box
+    return max(0, x0 - p), max(0, y0 - p), min(W, x1 + p), min(H, y1 + p)
+
+
+def _norm_box(a: Tuple[int, int], b: Tuple[int, int], size: Tuple[int, int]):
+    W, H = size
+    x0, x1 = sorted((min(max(a[0], 0), W), min(max(b[0], 0), W)))
+    y0, y1 = sorted((min(max(a[1], 0), H), min(max(b[1], 0), H)))
+    return x0, y0, x1, y1
+
+
+def _crop_overlay(st: Optional[dict], pad: float) -> Optional[Image.Image]:
+    """Downscaled copy of the upload with the selected box drawn and the outside dimmed."""
+    if not st:
+        return None
+    from PIL import ImageDraw
+    img, s = st["img"], st["scale"]
+    disp = img.resize((max(1, round(img.width * s)), max(1, round(img.height * s))),
+                      Image.LANCZOS) if s < 1.0 else img.copy()
+    if st["box"]:
+        x0, y0, x1, y1 = [round(v * s) for v in _pad_box(st["box"], pad, img.size)]
+        shaded = Image.blend(disp, Image.new("RGB", disp.size, (0, 0, 0)), 0.45)
+        shaded.paste(disp.crop((x0, y0, x1, y1)), (x0, y0))
+        disp = shaded
+        lw = max(2, round(max(disp.size) / 400))
+        ImageDraw.Draw(disp).rectangle((x0, y0, x1, y1), outline=(255, 64, 64), width=lw)
+    return disp
+
+
+def _crop_status(st: Optional[dict]) -> str:
+    if not st:
+        return '<span style="color:#8b949e">Upload an image to start.</span>'
+    W, H = st["img"].size
+    if st["box"]:
+        x0, y0, x1, y1 = st["box"]
+        return (f'<span style="color:#3fb950">Box ({x0}, {y0}) → ({x1}, {y1}) · '
+                f'{x1 - x0}×{y1 - y0}px of {W}×{H} — drag again to re-crop</span>')
+    return (f'<span style="color:#8b949e">Image {W}×{H}px — press, drag and release over '
+            f'a text line, or use "Whole image".</span>')
+
+
+def _box_fields(st: Optional[dict]):
+    box = (st or {}).get("box") or (None, None, None, None)
+    return [gr.update(value=v) for v in box]
+
+
+def crop_upload_cb(pil: Optional[Image.Image], pad: float):
+    st = _crop_new_state(pil) if pil is not None else None
+    return (st, _crop_overlay(st, pad), _crop_status(st), *_box_fields(st))
+
+
+def crop_drag_cb(box_str: str, st: Optional[dict], pad: float):
+    """Receive 'x0,y0,x1,y1' (displayed-image pixels) from the drag script."""
+    try:
+        c = [float(v) for v in (box_str or "").split(",")]
+        if len(c) != 4:
+            raise ValueError(box_str)
+    except ValueError:
+        c = None
+    if not st or c is None:
+        return (st, gr.update(), _crop_status(st), *[gr.update()] * 4)
+    s = st["scale"]
+    st["box"] = _norm_box((round(c[0] / s), round(c[1] / s)),
+                          (round(c[2] / s), round(c[3] / s)), st["img"].size)
+    return (st, _crop_overlay(st, pad), _crop_status(st), *_box_fields(st))
+
+
+def crop_apply_fields_cb(st: Optional[dict], pad: float, x0, y0, x1, y1):
+    if not st:
+        return st, None, _crop_status(st)
+    if None in (x0, y0, x1, y1):
+        return st, _crop_overlay(st, pad), _err("Fill in all four coordinates.")
+    st["box"] = _norm_box((int(x0), int(y0)), (int(x1), int(y1)), st["img"].size)
+    return st, _crop_overlay(st, pad), _crop_status(st)
+
+
+def crop_whole_cb(st: Optional[dict], pad: float):
+    if not st:
+        return (st, None, _crop_status(st), *[gr.update()] * 4)
+    st["box"] = (0, 0, *st["img"].size)
+    return (st, _crop_overlay(st, pad), _crop_status(st), *_box_fields(st))
+
+
+_CROP_N_OUTPUTS = 9
+_TASHKEEL = set(chr(c) for c in range(0x064B, 0x0653))
+
+
+def _line_flag(text: str) -> str:
+    """Cheap per-line sanity checks shown in the review table."""
+    letters = [c for c in text if not c.isspace()]
+    if not letters:
+        return "empty — nothing read on this line"
+    if sum(c in _TASHKEEL for c in letters) / len(letters) > 0.15:
+        return "heavy diacritics — possibly invented text (signature / stamp?)"
+    return ""
+
+
+def _lines_review_html(lines: List[Image.Image], texts: List[str]) -> str:
+    """Each segmented line image above the text read from it, so nothing is silently lost."""
+    import base64
+    import io
+    rows = []
+    for i, (im, t) in enumerate(zip(lines, texts), 1):
+        h = 40
+        th = im.convert("RGB").resize((max(1, round(im.width * h / max(1, im.height))), h),
+                                      Image.LANCZOS)
+        buf = io.BytesIO()
+        th.save(buf, "PNG")
+        flag = _line_flag(t)
+        rows.append(
+            f'<div class="lr{" bad" if flag else ""}"><span class="n">{i}</span>'
+            f'<img src="data:image/png;base64,{base64.b64encode(buf.getvalue()).decode()}">'
+            f'<div class="tx">{_html.escape(t) or "—"}</div>'
+            + (f'<div class="fl">⚠ {flag}</div>' if flag else "") + "</div>")
+    n_bad = sum(bool(_line_flag(t)) for t in texts)
+    head = (f'<div class="lr-head">{len(lines)} line(s) detected · '
+            f'{len(lines) - n_bad} read cleanly'
+            + (f' · <b>{n_bad} need a look</b>' if n_bad else "") + "</div>")
+    return _LINES_CSS + '<div class="lr-wrap">' + head + "".join(rows) + "</div>"
+
+
+_LINES_CSS = """
+<style>
+  .lr-wrap { border:1px solid var(--border-color-primary); border-radius:8px; padding:8px; }
+  .lr-head { font-size:.9em; opacity:.8; margin-bottom:6px; }
+  .lr { padding:6px 4px; border-top:1px solid var(--border-color-primary); }
+  .lr.bad { background:rgba(248,81,73,.10); }
+  .lr .n { font-family:ui-monospace,monospace; font-size:.8em; opacity:.6; margin-right:6px; }
+  .lr img { max-width:100%; height:40px; object-fit:contain; object-position:right;
+            display:block; margin-left:auto; background:#fff; }
+  .lr .tx { direction:rtl; text-align:right; font-size:1.3rem; line-height:1.9;
+            font-family:"Noto Naskh Arabic","Geeza Pro","Arabic Typesetting","Segoe UI",Tahoma,sans-serif; }
+  .lr .fl { font-size:.8em; color:#f85149; }
+</style>
+"""
+
+
+def _recognize_qari(crop: Image.Image, force_multiline: bool, progress) -> Tuple[str, Image.Image, list, list]:
+    from .vlm_engine import get_engine, prepare_line
+    lines = segment_into_lines(crop) if force_multiline else [crop]
+    eng = get_engine(str(device))
+    if not eng.loaded:
+        progress(0, desc="Loading Qari-OCR v0.4 (first use, ~30 s)…")
+    texts = eng.recognize_lines(
+        lines, progress=lambda d, n: progress(d / n, desc=f"Reading line {d}/{n}"))
+    return "\n".join(texts), stack_preview([prepare_line(l) for l in lines]), lines, texts
+
+
+@torch.inference_mode()
+def crop_recognize_cb(st: Optional[dict], engine_label: str, pad: float, angle: float,
+                      upscale: float, auto_upscale: bool,
+                      force_multiline: bool, polarity_label: str, use_beam: bool,
+                      beam_width: int, lm_weight: float, gt_text: str, history: list,
+                      progress=gr.Progress()):
+    keep = [gr.update()] * 3  # leave crop / text / preview untouched on error
+    if not st:
+        return (None, "", None, _err("Upload an image first."), "", "", "", history, history)
+    box = st["box"] or (0, 0, *st["img"].size)
+    x0, y0, x1, y1 = _pad_box(box, pad, st["img"].size)
+    if x1 - x0 < 8 or y1 - y0 < 8:
+        return (*keep, _err(f"Region too small ({x1 - x0}×{y1 - y0}px)."),
+                "", "", "", history, history)
+
+    crop = rotate_if_needed(st["img"].crop((x0, y0, x1, y1)), angle)
+    use_qari = engine_label == ENGINE_QARI
+    t0 = time.perf_counter()
+    try:
+        if use_qari:
+            txt, prev, lines, texts = _recognize_qari(crop, bool(force_multiline), progress)
+        else:
+            txt, prev = recognize_image(
+                crop, upscale=float(upscale), auto_upscale=bool(auto_upscale),
+                force_multiline=bool(force_multiline),
+                polarity_mode=_map_polarity(polarity_label), use_beam=bool(use_beam),
+                beam_width=int(beam_width), lm_weight=float(lm_weight), show_heatmap=True,
+            )
+            lines = segment_into_lines(crop) if force_multiline else [crop]
+            texts = txt.split("\n")
+    except Exception as e:  # missing VLM deps, OOM on a shared GPU, download failure…
+        return (*keep, _err(f"{type(e).__name__}: {e}"), "", "", "", history, history)
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    gt = (gt_text or "").strip()
+    info = (f'<span style="color:#8b949e">{"Qari-OCR v0.4" if use_qari else "KHATT CRNN"} · '
+            f'crop {x1 - x0}×{y1 - y0}px · {len(lines)} line(s) · '
+            f'{elapsed_ms / 1000:.1f} s · device={device}</span>')
+
+    history = list(history or []) + [[
+        len(history or []) + 1, "Qari" if use_qari else "KHATT",
+        f"{x0},{y0},{x1},{y1}", f"{x1 - x0}×{y1 - y0}",
+        txt.replace("\n", " ⏎ "), gt, f"{cer_raw(gt, txt) * 100:.2f}" if gt else "",
+        f"{elapsed_ms:.0f}",
+    ]]
+    return (crop, txt, prev, _fmt_metrics(gt, txt), info, _diff_html(gt, txt),
+            _lines_review_html(lines, texts), history, history)
+
+
+def crop_auto_cb(auto: bool, st: Optional[dict], *args, progress=gr.Progress()):
+    """Chained after a drag: recognize the new box straight away."""
+    if not auto or not st or not st["box"]:
+        return tuple(gr.update() for _ in range(_CROP_N_OUTPUTS))
+    return crop_recognize_cb(st, *args, progress=progress)
+
+
+def crop_export_cb(history: list):
+    import csv as _csv
+    import tempfile
+    if not history:
+        return None
+    tmp = tempfile.NamedTemporaryFile("w", suffix=".tsv", delete=False,
+                                      encoding="utf-8", newline="")
+    writer = _csv.writer(tmp, delimiter="\t")
+    writer.writerow(_CROP_HIST_HEADERS)
+    for row in history:
+        writer.writerow([str(v).replace("\t", " ") for v in row])
+    tmp.close()
+    return tmp.name
+
+
+with gr.Blocks(title="Arabic OCR — Test Bench", head=_CROP_DRAG_HEAD, css=_CROP_CSS) as demo:
     gr.Markdown(
         "## Arabic OCR — Test Bench\n"
         "Single image, batch folder/ZIP, KHATT sample loader, live CER/WER, "
         "character diff, confidence heatmap, pipeline preview, decoder comparison."
     )
     with gr.Tabs():
+        # =============== Crop & Test tab ===============
+        with gr.Tab("Crop & Test"):
+            gr.Markdown(
+                "**1.** Upload an image · **2.** press, drag and release over a text line "
+                "on the canvas · **3.** the crop is recognized and logged below. "
+                "Multi-line crops are split into lines and every line is read separately — "
+                "check the **line-by-line** panel below to confirm nothing was skipped. "
+                "Use **Qari-OCR** for typed/printed Arabic, **KHATT** for handwriting."
+            )
+            crop_state = gr.State(None)
+            crop_hist_state = gr.State([])
+            with gr.Row():
+                with gr.Column(scale=1, min_width=320):
+                    crop_upload = gr.Image(label="Upload image", type="pil", image_mode="RGB",
+                                           sources=["upload", "clipboard"], height=200)
+                    with gr.Row():
+                        crop_x0 = gr.Number(label="x0", precision=0, min_width=60)
+                        crop_y0 = gr.Number(label="y0", precision=0, min_width=60)
+                        crop_x1 = gr.Number(label="x1", precision=0, min_width=60)
+                        crop_y1 = gr.Number(label="y1", precision=0, min_width=60)
+                    with gr.Row():
+                        crop_apply_btn = gr.Button("Apply coordinates", size="sm")
+                        crop_whole_btn = gr.Button("Whole image", size="sm")
+                    crop_pad = gr.Slider(0, 60, value=6, step=1, label="Padding around box (px)",
+                                         info="keeps dots near the box edge from being cut")
+                    crop_engine = gr.Radio(
+                        [ENGINE_QARI, ENGINE_KHATT], value=ENGINE_QARI, label="OCR engine",
+                        info="Qari reads typed/printed pages far better (72% vs 9% of words "
+                             "on 1970s typed letters); first use downloads ~3 GB and loads "
+                             "for ~30 s. KHATT is the handwriting model of this repo.")
+                    crop_auto = gr.Checkbox(value=True,
+                                            label="Recognize automatically on release")
+                    with gr.Accordion("Recognition options (segmentation applies to both "
+                                      "engines; the rest is KHATT-only)", open=False):
+                        crop_angle = gr.Slider(-30.0, 30.0, value=0.0, step=0.5,
+                                               label="Rotate crop (deg)")
+                        crop_upscale = gr.Slider(1.0, 3.0, value=1.3, step=0.1, label="Upscale")
+                        crop_auto_up = gr.Checkbox(
+                            value=True, label=f"Auto-upscale small text "
+                                              f"(lines < {AUTO_UPSCALE_MIN_H}px)")
+                        crop_multi = gr.Checkbox(value=True,
+                                                 label="Auto-segment crop into lines "
+                                                       "(a single-line crop stays one line)")
+                        crop_pol = gr.Radio(
+                            choices=["Auto (try both)", "Normal (black on white)",
+                                     "Invert (white on black)"],
+                            value="Auto (try both)", label="Polarity",
+                        )
+                        crop_beam = gr.Checkbox(value=True, label="Beam search (else greedy)")
+                        crop_beam_w = gr.Slider(1, 30, value=10, step=1, label="Beam width")
+                        crop_lm_w = gr.Slider(0.0, 1.0, value=0.3, step=0.05,
+                                              label="Bigram LM weight (0 = disabled)")
+                    crop_gt = gr.Textbox(label="Ground truth for this crop (optional → CER/WER)",
+                                         lines=2, rtl=True, elem_classes="arabic-text")
+                    crop_run_btn = gr.Button("Recognize crop", variant="primary")
+                with gr.Column(scale=2):
+                    crop_canvas = gr.Image(label="Drag to select a region",
+                                           type="pil", interactive=False, height=520,
+                                           elem_id="crop-canvas", show_download_button=False,
+                                           show_fullscreen_button=False)
+                    crop_status = gr.HTML(_crop_status(None))
+                    # Bridge for the drag script (_CROP_DRAG_HEAD); hidden via CSS
+                    # because visible=False components are not rendered in the DOM.
+                    crop_drag_box = gr.Textbox(elem_classes="crop-hidden", container=False)
+                    crop_drag_btn = gr.Button(elem_id="crop-drag-btn",
+                                              elem_classes="crop-hidden")
+            with gr.Row():
+                crop_view = gr.Image(label="Cropped region", type="pil", interactive=False,
+                                     height=200)
+                crop_text = gr.Textbox(label="Prediction (RTL)", lines=12, max_lines=80,
+                                       rtl=True, show_copy_button=True,
+                                       elem_classes="arabic-text")
+            crop_metrics = gr.HTML()
+            crop_timing = gr.HTML()
+            crop_diff = gr.HTML()
+            with gr.Accordion("Line-by-line check (each detected line → its text)", open=True):
+                crop_lines = gr.HTML()
+            crop_prev = gr.Image(label="What the model saw (preprocessed + confidence heatmap)",
+                                 type="pil", interactive=False)
+            gr.Markdown("#### Crop history (this session)")
+            crop_df = gr.Dataframe(headers=_CROP_HIST_HEADERS, value=[], wrap=True,
+                                   interactive=False)
+            with gr.Row():
+                crop_clear_btn = gr.Button("Clear history", size="sm")
+                crop_export_btn = gr.Button("Export history (TSV)", size="sm")
+            crop_export_file = gr.File(label="History TSV")
+
         # =============== Single image tab ===============
         with gr.Tab("Single"):
             with gr.Row():
@@ -840,6 +1274,47 @@ with gr.Blocks(title="Arabic OCR — Test Bench") as demo:
                 gr.Markdown("_No curated samples found locally._")
                 example_df = gr.Dataframe(visible=False)
 
+    # ---- wiring: Crop & Test ----
+    _crop_box_fields = [crop_x0, crop_y0, crop_x1, crop_y1]
+    _crop_rec_inputs = [crop_engine, crop_pad, crop_angle, crop_upscale, crop_auto_up,
+                        crop_multi, crop_pol,
+                        crop_beam, crop_beam_w, crop_lm_w, crop_gt, crop_hist_state]
+    _crop_rec_outputs = [crop_view, crop_text, crop_prev, crop_metrics, crop_timing,
+                         crop_diff, crop_lines, crop_hist_state, crop_df]
+    crop_upload.upload(
+        fn=crop_upload_cb, inputs=[crop_upload, crop_pad],
+        outputs=[crop_state, crop_canvas, crop_status, *_crop_box_fields],
+    )
+    crop_upload.clear(
+        fn=lambda pad: crop_upload_cb(None, pad), inputs=[crop_pad],
+        outputs=[crop_state, crop_canvas, crop_status, *_crop_box_fields],
+    )
+    crop_drag_btn.click(
+        fn=crop_drag_cb, inputs=[crop_drag_box, crop_state, crop_pad],
+        outputs=[crop_state, crop_canvas, crop_status, *_crop_box_fields],
+        js="(box, st, pad) => [window.__arabicocrCropBox || box, st, pad]",
+    ).then(
+        fn=crop_auto_cb, inputs=[crop_auto, crop_state, *_crop_rec_inputs],
+        outputs=_crop_rec_outputs,
+    )
+    crop_apply_btn.click(
+        fn=crop_apply_fields_cb, inputs=[crop_state, crop_pad, *_crop_box_fields],
+        outputs=[crop_state, crop_canvas, crop_status],
+    )
+    crop_whole_btn.click(
+        fn=crop_whole_cb, inputs=[crop_state, crop_pad],
+        outputs=[crop_state, crop_canvas, crop_status, *_crop_box_fields],
+    )
+    crop_pad.release(fn=_crop_overlay, inputs=[crop_state, crop_pad], outputs=[crop_canvas])
+    crop_run_btn.click(
+        fn=crop_recognize_cb, inputs=[crop_state, *_crop_rec_inputs],
+        outputs=_crop_rec_outputs,
+    )
+    crop_clear_btn.click(fn=lambda: ([], []), inputs=None,
+                         outputs=[crop_hist_state, crop_df])
+    crop_export_btn.click(fn=crop_export_cb, inputs=[crop_hist_state],
+                          outputs=[crop_export_file])
+
     # ---- wiring ----
     run_btn.click(
         fn=infer,
@@ -900,5 +1375,13 @@ with gr.Blocks(title="Arabic OCR — Test Bench") as demo:
 
 
 if __name__ == "__main__":
-    print("Device:", device, torch.cuda.get_device_name(0) if device.type == "cuda" else "")
-    demo.launch(server_name="127.0.0.1", server_port=7860)
+    import argparse
+    ap = argparse.ArgumentParser(description="Arabic OCR Gradio test bench. "
+                                 "Pin a GPU with ARABICOCR_DEVICE=cuda:1 "
+                                 "(or CUDA_VISIBLE_DEVICES=1).")
+    ap.add_argument("--host", default=os.environ.get("ARABICOCR_HOST", "127.0.0.1"))
+    ap.add_argument("--port", type=int, default=int(os.environ.get("ARABICOCR_PORT", 7860)))
+    ap.add_argument("--share", action="store_true", help="create a public gradio.live link")
+    args = ap.parse_args()
+    print("Device:", device, torch.cuda.get_device_name(device) if device.type == "cuda" else "")
+    demo.launch(server_name=args.host, server_port=args.port, share=args.share)

@@ -78,15 +78,81 @@ def _robust_binarize(pil_img: Image.Image) -> np.ndarray:
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     g = clahe.apply(g)
     _, bw = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    if (bw == 0).mean() < 0.12:
+    # Ink is the minority class: if black dominates, the page is light-on-dark
+    # -> invert so ink is black on white (segment_into_lines expects that).
+    if (bw == 0).mean() > 0.5:
         bw = 255 - bw
     return bw
+
+
+def _projection_bands(text: np.ndarray, min_h: int) -> list[tuple[int, int, int, int]]:
+    """Split a dense text block into lines by its horizontal ink profile.
+
+    Fallback for tightly spaced lines (e.g. typed documents) where the
+    morphological pass fuses every line into one component.
+    Returns (y, x, w, h) boxes, top to bottom.
+    """
+    H, W = text.shape
+    prof = np.convolve((text > 0).sum(axis=1).astype(np.float32), np.ones(3) / 3, mode="same")
+    if prof.max() <= 0:
+        return []
+    on = prof > prof.max() * 0.08
+    edges = np.flatnonzero(np.diff(np.concatenate(([0], on.astype(np.int8), [0]))))
+    bands = [[int(a), int(b)] for a, b in zip(edges[::2], edges[1::2])]
+    if len(bands) < 2:
+        return []
+
+    # Fold thin bands (detached dots / diacritics) into the nearer neighbour.
+    med = float(np.median([b - a for a, b in bands]))
+    main = [b for b in bands if b[1] - b[0] >= 0.45 * med]
+    for a, b in (t for t in bands if t[1] - t[0] < 0.45 * med):
+        if not main:
+            break
+        near = min(main, key=lambda m: min(abs(a - m[1]), abs(m[0] - b)))
+        near[0], near[1] = min(near[0], a), max(near[1], b)
+
+    # Split bands spanning several lines (touching ascenders/descenders) at the
+    # profile minima, using the typical line pitch to decide how many lines.
+    if len(main) >= 3:
+        pitch = float(np.median(np.diff([m[0] for m in main])))
+        split = []
+        for a, b in main:
+            n = int(round((b - a) / pitch + 0.25)) if pitch > 0 else 1
+            if n < 2:
+                split.append([a, b])
+                continue
+            cuts, r = [a], max(1, int(pitch * 0.3))
+            for k in range(1, n):
+                c = a + k * (b - a) // n
+                lo, hi = max(a + 1, c - r), min(b - 1, c + r)
+                cuts.append(lo + int(np.argmin(prof[lo:hi])) if hi > lo else c)
+            cuts.append(b)
+            split += [[cuts[i], cuts[i + 1]] for i in range(n)]
+        main = split
+    # Raw bands are bare ink cores; min_h is checked after padding below.
+    main = [m for m in main if m[1] - m[0] >= max(4, min_h // 3)]
+    if len(main) < 2:
+        return []
+
+    # Pad each line halfway into the gaps around it (dots sit near the edges).
+    cap = int(0.35 * med)
+    boxes = []
+    for i, (a, b) in enumerate(main):
+        top = a - min(cap, (a - main[i - 1][1]) // 2 if i else cap)
+        bot = b + min(cap, (main[i + 1][0] - b) // 2 if i + 1 < len(main) else cap)
+        top, bot = max(0, top), min(H, bot)
+        if bot - top < min_h:
+            continue
+        cols = np.flatnonzero((text[top:bot] > 0).any(axis=0))
+        x0, x1 = (int(cols[0]), int(cols[-1]) + 1) if cols.size else (0, W)
+        boxes.append((top, x0, x1 - x0, bot - top))
+    return boxes if len(boxes) >= 2 else []
 
 
 def segment_into_lines(
     pil_img: Image.Image,
     min_h: int = 14,
-    min_width_ratio: float = 0.35,
+    min_width_ratio: float = 0.12,
     remove_ruled_lines: bool = True
 ) -> list[Image.Image]:
     bw = _robust_binarize(pil_img)
@@ -108,12 +174,17 @@ def segment_into_lines(
     cc = (smooth > 0).astype(np.uint8)
     num, labels, stats, _ = cv2.connectedComponentsWithStats(cc, connectivity=8)
 
+    # Width filter is relative to the widest text band, not the page, so photos
+    # with wide margins (lines spanning ~30% of the frame) still segment.
+    tall = [stats[i][2] for i in range(1, num) if stats[i][3] >= min_h]
+    ref_w = max(tall) if tall else W
+
     boxes = []
     for i in range(1, num):
         x, y, w, h, area = stats[i]
         if h < min_h:
             continue
-        if w < int(W * min_width_ratio):
+        if w < int(ref_w * min_width_ratio):
             continue
         if h > H * 0.35 and w < W * 0.60:
             continue
@@ -130,6 +201,15 @@ def segment_into_lines(
             merged[-1] = (ny, nx, nx2 - nx, ny2 - ny)
         else:
             merged.append((y, x, w, h))
+
+    # The morphological pass fuses lines whose ascenders/descenders touch or
+    # sit closer than the merge gap; re-split every box by its own ink profile
+    # (a genuine single line yields no split and is kept as-is).
+    split = []
+    for y, x, w, h in merged:
+        sub = _projection_bands(text[y:y + h, x:x + w], min_h)
+        split += [(y + sy, x + sx, sw, sh) for sy, sx, sw, sh in sub] or [(y, x, w, h)]
+    merged = split or _projection_bands(text, min_h)
 
     lines = [pil_img.crop((x, y, x + w, y + h)) for (y, x, w, h) in merged]
     return lines or [pil_img]
